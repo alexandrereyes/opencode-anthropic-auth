@@ -33,7 +33,7 @@
     "release:next": "bun scripts/validate-next-release.ts && bun run release"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "0.0.0-next-17444"
+    "@opencode/plugin": "2.0.4"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.2",
