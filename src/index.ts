@@ -1,4 +1,4 @@
-import { type Credential, Plugin } from '@opencode-ai/plugin'
+import { type Credential, Plugin } from '@opencode/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
 import { resolveClaudeCodeVersion } from './config.ts'
 import { CLAUDE_CODE_VERSION, REQUIRED_BETAS } from './constants.ts'
