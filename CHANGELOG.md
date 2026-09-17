@@ -1,5 +1,11 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.0.0-next.2
+
+### Patch Changes
+
+- [#257](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/257) [`ee4b15c`](https://github.com/ex-machina-co/opencode-anthropic-auth/commit/ee4b15c93cbbd168df2035dbbcf30aa64c807d6e) Thanks [@CasualDeveloper](https://github.com/CasualDeveloper)! - Update the OpenCode v2 plugin SDK dependency and import to `@opencode/plugin@2.0.4`, following OpenCode's npm scope migration.
+
 ## 2.0.0-next.1
 
 ### Patch Changes
