@@ -117,7 +117,7 @@ one-hour cache for primary agent requests:
 {
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-anthropic-auth",
+      "package": "/absolute/path/to/opencode-anthropic-auth/dist",
       "options": { "promptCacheTtl": "1h" }
     }
   ]
@@ -136,6 +136,24 @@ This requires an OpenCode v2 runtime exposing `kind` on HTTP request hooks; olde
 runtimes retain their original cache policy.
 
 This controls cache lifetime, not subscription quota accounting or billing mode.
+
+#### Installing this fork's compiled release
+
+The current OpenCode V2 installer does not accept remote `.tgz` URLs as plugin
+references and skips package lifecycle scripts. Install the published artifact
+first, then configure its compiled `dist` directory:
+
+```sh
+npm install --ignore-scripts --no-audit --no-fund \
+  --prefix "$HOME/.local/share/opencode-custom-plugins/anthropic-auth/2.0.0-next.1-custom.1" \
+  https://github.com/alexandrereyes/opencode-anthropic-auth/releases/download/v2.0.0-next.1-custom.1/ex-machina-opencode-anthropic-auth-2.0.0-next.1-custom.1.tgz
+```
+
+Replace the existing plugin entry with the object above, using the absolute path
+to `node_modules/@ex-machina/opencode-anthropic-auth/dist` under that installation
+prefix. Do not keep the original npm plugin enabled alongside the fork. The
+plugin and integration IDs remain unchanged, so existing OAuth credentials are
+reused.
 
 The plugin reads the following environment variables:
 
