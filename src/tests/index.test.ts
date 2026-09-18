@@ -20,6 +20,7 @@ function createMockContext() {
   const integrationMethods: Array<Record<string, unknown>> = []
   const sessionHooks = new Map<string, (event: any) => Promise<void> | void>()
   const ctx = {
+    options: {} as Record<string, unknown>,
     integration: {
       transform: mock(async (cb: (draft: any) => void) => {
         const draft = {
@@ -367,6 +368,68 @@ describe('session http.request hook', () => {
     return mocked
   }
 
+  test.each([
+    ['primary', undefined, undefined],
+    ['primary', '1h', '1h'],
+    ['primary', '5m', '5m'],
+    ['title', '1h', undefined],
+    ['compaction', '1h', undefined],
+    ['generate', '1h', undefined],
+  ])('cache TTL for %s with option %s', async (kind, option, expected) => {
+    const { ctx, sessionHooks } = anthropicOAuthContext()
+    ctx.options.promptCacheTtl = option
+    await plugin.setup(ctx as any)
+    const marker = { type: 'ephemeral' }
+    const body = {
+      tools: [
+        {
+          name: 'read',
+          cache_control: marker,
+          input_schema: { type: 'object' },
+        },
+      ],
+      system: [
+        { type: 'text', text: 'Stable instructions', cache_control: marker },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'Hello', cache_control: marker }],
+        },
+      ],
+    }
+    const event = {
+      kind,
+      model: { providerID: 'anthropic', id: 'claude-fable-5-1' },
+      request: new Request('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'anthropic-beta': 'existing-beta' },
+        body: JSON.stringify(body),
+      }),
+    }
+    await sessionHooks.get('http.request')!(event)
+    const result = JSON.parse(await event.request.text())
+    const wanted = expected ? { type: 'ephemeral', ttl: expected } : marker
+    expect(result.tools[0].cache_control).toEqual(wanted)
+    expect(result.system.at(-1).cache_control).toEqual(wanted)
+    expect(result.messages[0].content[0].cache_control).toEqual(wanted)
+    expect(result.system[0].cache_control).toBeUndefined()
+    expect(event.request.headers.get('anthropic-beta')).toContain(
+      'existing-beta',
+    )
+    expect(
+      event.request.headers
+        .get('anthropic-beta')
+        ?.includes('extended-cache-ttl-2025-04-11'),
+    ).toBe(expected === '1h')
+  })
+
+  test('rejects an unsupported TTL at plugin setup', async () => {
+    const { ctx } = createMockContext()
+    ctx.options.promptCacheTtl = 'forever'
+    await expect(plugin.setup(ctx as any)).rejects.toThrow('promptCacheTtl')
+  })
+
   test('ignores non-anthropic providers', async () => {
     const { ctx, sessionHooks } = createMockContext()
     await plugin.setup(ctx as any)
@@ -386,6 +449,7 @@ describe('session http.request hook', () => {
 
   test('leaves API-key Anthropic requests untouched', async () => {
     const { ctx, sessionHooks } = createMockContext()
+    ctx.options.promptCacheTtl = '1h'
     await plugin.setup(ctx as any)
 
     const originalRequest = new Request(

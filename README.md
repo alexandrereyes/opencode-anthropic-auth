@@ -108,6 +108,35 @@ OpenCode v2 provides:
 
 ## Configuration
 
+### OpenCode v2 prompt-cache lifetime
+
+For subscription sessions with pauses longer than five minutes, opt into a
+one-hour cache for primary agent requests:
+
+```json
+{
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-anthropic-auth",
+      "options": { "promptCacheTtl": "1h" }
+    }
+  ]
+}
+```
+
+Use your pinned v2 package version or local plugin path in `package`. This option
+requires a plugin build containing this change; it is not in `2.0.0-next.1`.
+`promptCacheTtl` accepts `"1h"` or `"5m"`. When omitted, existing cache markers are
+preserved. The option sets the TTL on existing breakpoints and adds the extended
+cache beta header for `"1h"`; it does not add breakpoints or enable disabled caching.
+It applies only with Claude Pro/Max OAuth, to primary requests (including primary
+requests in subagent sessions). Title, compaction, and transient generation
+requests retain their original cache policy. API-key authentication is unaffected.
+This requires an OpenCode v2 runtime exposing `kind` on HTTP request hooks; older
+runtimes retain their original cache policy.
+
+This controls cache lifetime, not subscription quota accounting or billing mode.
+
 The plugin reads the following environment variables:
 
 - **`ANTHROPIC_BASE_URL`** — Overrides the Anthropic API endpoint for both release lines, such as when using a proxy. Must be a valid HTTP(S) URL.

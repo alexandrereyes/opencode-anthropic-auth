@@ -330,9 +330,17 @@ export function setOAuthHeaders(
   headers: Headers,
   accessToken: string,
   version: string = CLAUDE_CODE_VERSION,
+  cacheTtl?: '5m' | '1h',
 ): Headers {
   headers.set('authorization', `Bearer ${accessToken}`)
   headers.set('anthropic-beta', mergeBetaHeaders(headers))
+  if (cacheTtl === '1h') {
+    const betas = headers.get('anthropic-beta')?.split(',') ?? []
+    headers.set(
+      'anthropic-beta',
+      [...new Set([...betas, 'extended-cache-ttl-2025-04-11'])].join(','),
+    )
+  }
   headers.set('user-agent', formatUserAgent(version))
   headers.delete('x-api-key')
   return headers
@@ -580,9 +588,28 @@ export function prependClaudeCodeIdentity(system: unknown): SystemBlock[] {
 export function rewriteRequestBody(
   body: string,
   version: string = CLAUDE_CODE_VERSION,
+  cacheTtl?: '5m' | '1h',
 ): string {
   try {
     const parsed = JSON.parse(body)
+    if (cacheTtl) {
+      // Only rewrite API cache markers, never similarly named fields in tool
+      // schemas or tool inputs. A uniform TTL preserves Anthropic's ordering rule.
+      const mark = (value: unknown) => {
+        if (!isRecord(value) || !isRecord(value.cache_control)) return
+        if (value.cache_control.type === 'ephemeral') {
+          value.cache_control.ttl = cacheTtl
+        }
+      }
+      mark(parsed)
+      if (Array.isArray(parsed.tools)) parsed.tools.forEach(mark)
+      if (Array.isArray(parsed.system)) parsed.system.forEach(mark)
+      if (Array.isArray(parsed.messages)) {
+        for (const message of parsed.messages) {
+          if (Array.isArray(message.content)) message.content.forEach(mark)
+        }
+      }
+    }
     const billingHeader =
       Array.isArray(parsed.messages) &&
       parsed.messages.some(

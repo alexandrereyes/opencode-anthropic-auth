@@ -74,6 +74,14 @@ function isTransformedOAuthRequest(request: Request): boolean {
 export default Plugin.define({
   id: PLUGIN_ID,
   setup: async (ctx) => {
+    const promptCacheTtl = ctx.options.promptCacheTtl
+    if (
+      promptCacheTtl !== undefined &&
+      promptCacheTtl !== '5m' &&
+      promptCacheTtl !== '1h'
+    ) {
+      throw new Error('promptCacheTtl must be "5m" or "1h"')
+    }
     warnIfInsecureUnsupported()
     // Resolved once per plugin instance so every request reports the same
     // version in both the user-agent and the billing header.
@@ -165,13 +173,15 @@ export default Plugin.define({
       const request = event.request
       const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
       const bodyText = hasBody ? await request.clone().text() : undefined
+      const cacheTtl =
+        'kind' in event && event.kind === 'primary' ? promptCacheTtl : undefined
       const rewrittenBody =
         bodyText !== undefined
-          ? rewriteRequestBody(bodyText, claudeCodeVersion)
+          ? rewriteRequestBody(bodyText, claudeCodeVersion, cacheTtl)
           : undefined
 
       const headers = mergeHeaders(request)
-      setOAuthHeaders(headers, credential.access, claudeCodeVersion)
+      setOAuthHeaders(headers, credential.access, claudeCodeVersion, cacheTtl)
       if (rewrittenBody !== undefined) headers.delete('content-length')
 
       const { input: rewrittenInput } = rewriteUrl(request.url)
