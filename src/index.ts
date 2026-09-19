@@ -2,6 +2,7 @@ import { type Credential, Plugin } from '@opencode-ai/plugin'
 import { authorize, exchange, refreshToken } from './auth.ts'
 import { resolveClaudeCodeVersion } from './config.ts'
 import { CLAUDE_CODE_VERSION, REQUIRED_BETAS } from './constants.ts'
+import { createRetryBridge, RETRY_HEADER, registerRetryHook } from './retry.ts'
 import {
   createStrippedStream,
   isInsecure,
@@ -36,13 +37,16 @@ function toCredential(exchanged: {
 
 async function resolveActiveOAuth(
   ctx: Plugin.Context,
-): Promise<Credential.OAuth | undefined> {
+): Promise<{ credential: Credential.OAuth; account?: string } | undefined> {
   const connection = await ctx.integration.connection.active(INTEGRATION_ID)
   if (!connection) return undefined
 
   const credential = await ctx.integration.connection.resolve(connection)
   if (credential?.type === 'oauth' && credential.methodID === METHOD_ID) {
-    return credential
+    return {
+      credential,
+      account: 'id' in connection ? connection.id : undefined,
+    }
   }
 
   return undefined
@@ -101,6 +105,7 @@ export default Plugin.define({
     // Retain successful refreshes for this plugin generation so a host call
     // holding the rotated token cannot submit it again before persistence.
     const refreshInFlight = new Map<string, Promise<Credential.OAuth>>()
+    const retryBridge = createRetryBridge()
     const refreshCredential = async (credential: Credential.OAuth) => {
       const existing = refreshInFlight.get(credential.refresh)
       if (existing) return existing
@@ -167,8 +172,10 @@ export default Plugin.define({
 
     await ctx.session.hook('http.request', async (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
-      const credential = await resolveActiveOAuth(ctx)
-      if (!credential) return
+      event.request.headers.delete(RETRY_HEADER)
+      const oauth = await resolveActiveOAuth(ctx)
+      if (!oauth) return
+      const credential = oauth.credential
 
       const request = event.request
       const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
@@ -200,10 +207,43 @@ export default Plugin.define({
       })
     })
 
-    await ctx.session.hook('http.response', (event) => {
+    await ctx.session.hook('http.response', async (event) => {
       if (event.model.providerID !== INTEGRATION_ID) return
+      // Strip upstream markers even when this response is not eligible.
+      event.response = retryBridge.response(
+        event.response,
+        event,
+        event.request.url,
+      )
       if (!isTransformedOAuthRequest(event.request)) return
+      if (event.response.status === 429 && !event.request.signal.aborted) {
+        // Optional retry enrichment must not replace the original provider
+        // failure if the connection disappeared or credential refresh fails.
+        const oauth = await resolveActiveOAuth(ctx).catch(() => undefined)
+        if (
+          oauth &&
+          event.request.headers.get('authorization') ===
+            `Bearer ${oauth.credential.access}`
+        ) {
+          event.response = retryBridge.response(
+            event.response,
+            event,
+            event.request.url,
+            oauth.account,
+          )
+        }
+      }
       event.response = createStrippedStream(event.response)
+    })
+
+    await registerRetryHook(ctx, async (event) => {
+      if (
+        event.model.providerID !== INTEGRATION_ID ||
+        !event.http?.headers[RETRY_HEADER]
+      )
+        return
+      const oauth = await resolveActiveOAuth(ctx).catch(() => undefined)
+      if (oauth?.account) retryBridge.retry(event, oauth.account)
     })
   },
 })

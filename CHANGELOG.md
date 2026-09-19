@@ -1,5 +1,11 @@
 # @ex-machina/opencode-anthropic-auth
 
+## 2.0.0-next.1-custom.2
+
+- Schedule native OpenCode retries using Anthropic OAuth quota reset headers, including waits longer than 15 minutes. Requires the companion core extension exposing HTTP metadata on the retry hook; older hosts retain their native retry policy.
+- Keep concurrent failures and account changes isolated, and ignore unrelated model-specific quota snapshots.
+- Preserve the configurable prompt-cache TTL from custom.1.
+
 ## 2.0.0-next.1
 
 ### Patch Changes

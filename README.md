@@ -108,6 +108,73 @@ OpenCode v2 provides:
 
 ## Configuration
 
+### OAuth reset-aware retries (custom OpenCode v2 build)
+
+For HTTP 429 responses to this plugin's Claude Pro/Max requests, the plugin can
+schedule OpenCode's native retry at the provider's reported reset, including
+five-hour and seven-day subscription limits. OpenCode owns the countdown,
+interruption and maximum attempt count; the plugin does not sleep or send probes.
+
+This requires the companion core extension exposing optional `event.http` on
+the `retry` hook, in both the Promise and Effect plugin APIs:
+
+```ts
+readonly http?: {
+  readonly url: string
+  readonly status: number
+  readonly headers: Readonly<Record<string, string>>
+}
+```
+
+These are response headers from the original failed physical attempt **after
+HTTP response hooks**, available only to runtime hooks, not persisted in the
+public session error. The pinned `@opencode-ai/plugin@0.0.0-next-17444` predates
+the hook; this fork contains one typed compatibility boundary rather than
+requiring an unpublished SDK. On older hosts without the hook or its HTTP
+metadata, retries retain the host's native behavior (including its delay cap).
+
+Reset selection is deliberately conservative:
+
+- `Retry-After` accepts seconds or an IMF-fixdate HTTP date.
+- Only the aggregate unified, shared `5h` and shared `7d` plan windows are used;
+  each requires its matching `*-status: rejected`. Their
+  `*-reset` values accept Unix seconds or RFC 3339. When multiple windows block,
+  the latest applicable reset wins, also respecting a longer `Retry-After`.
+  An explicit aggregate status other than `rejected` suppresses plan snapshots,
+  even when a window says `rejected`; a short bucket 429 must not inherit those
+  waits. Without aggregate status, explicitly rejected shared 5h/7d windows can
+  still supply deadlines. Model-specific windows (`7d_opus`, `7d_sonnet`, etc.)
+  and unknown names are ignored: a catalog ID or alias does not prove the wire
+  model family. Such requests rely on the provider's aggregate reset instead.
+  Utilization and representative-claim alone do not prove a blocked window.
+  Overage is an alternative budget, not a cumulative plan constraint.
+- Without a valid `Retry-After`, standard request/token buckets with an explicit
+  `*-remaining: 0` can supply an RFC 3339 reset. This waits for full replenishment;
+  token remaining counts can be rounded, so it is a conservative fallback.
+- A valid response `Date` accounts for clock skew. A one-second grace avoids
+  retrying on the boundary. Invalid, expired or timer-overflowing deadlines
+  (roughly 24.8 days) are ignored and leave the native policy in control.
+- `x-should-retry: false`, non-429 responses, timeouts and transport failures
+  retain native handling. Error bodies are not interpreted as reset timestamps.
+
+Each eligible response receives a local signed deadline header, bound to the
+plugin instance, connection ID, session, agent, model/variant and request endpoint
+(origin and path; the native HTTP error can omit query parameters).
+The header contains no credentials or account ID and is never sent upstream.
+Upstream copies are removed before processing. Retry verifies the signature
+against the current OAuth connection; another account or plugin generation
+cannot inherit the wait. Concurrent responses do not share a last-error cache.
+If the active token changes before a response arrives, that response falls back
+to native retry; token refresh after the response does not invalidate its marker
+when the connection ID is unchanged. Switching accounts during an already
+scheduled native wait does not reschedule it; interrupt the session to end it.
+
+Standard header formats are documented in the
+[Anthropic rate-limit reference](https://platform.claude.com/docs/en/api/rate-limits#response-headers).
+Unified subscription headers are an observed interface, not a published stable
+Anthropic API contract; examples include
+[CLIProxyAPI issue #4874](https://github.com/router-for-me/CLIProxyAPI/issues/4874).
+
 ### OpenCode v2 prompt-cache lifetime
 
 For subscription sessions with pauses longer than five minutes, opt into a
@@ -138,6 +205,21 @@ runtimes retain their original cache policy.
 This controls cache lifetime, not subscription quota accounting or billing mode.
 
 #### Installing this fork's compiled release
+
+To install the current fork from a source checkout, build and pack it first:
+
+```sh
+bun install --frozen-lockfile
+bun run build
+npm pack --ignore-scripts
+npm install --ignore-scripts --no-audit --no-fund \
+  --prefix "$HOME/.local/share/opencode-custom-plugins/anthropic-auth/2.0.0-next.1-custom.2" \
+  ./ex-machina-opencode-anthropic-auth-2.0.0-next.1-custom.2.tgz
+```
+
+Configure the absolute `node_modules/@ex-machina/opencode-anthropic-auth/dist`
+path under that prefix. Reset-aware retries also require the core extension
+described above. The previously published custom.1 artifact remains available:
 
 The current OpenCode V2 installer does not accept remote `.tgz` URLs as plugin
 references and skips package lifecycle scripts. Install the published artifact

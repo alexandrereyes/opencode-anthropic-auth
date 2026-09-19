@@ -2,6 +2,7 @@ import { describe, expect, mock, spyOn, test } from 'bun:test'
 import { ANTHROPIC_CLAUDE_CODE_VERSION_ENV_VAR } from '../config'
 import { CLAUDE_CODE_VERSION } from '../constants'
 import plugin from '../index'
+import { RETRY_HEADER, type RetryEvent } from '../retry'
 
 /** Restore the version override captured before a test mutated it. */
 function restoreVersionOverride(original: string | undefined) {
@@ -63,6 +64,282 @@ describe('default export', () => {
   test('is a v2 plugin definition with an id and a setup function', () => {
     expect(plugin.id).toBe('ex-machina.anthropic-auth')
     expect(plugin.setup).toBeFunction()
+  })
+})
+
+describe('OAuth reset retry hooks', () => {
+  async function fixture(modelID = 'claude') {
+    const result = createMockContext()
+    const account = { id: 'account-a', access: 'access-a' }
+    result.ctx.integration.connection.active.mockImplementation(async () => ({
+      id: account.id,
+    }))
+    result.ctx.integration.connection.resolve.mockImplementation(async () => ({
+      type: 'oauth',
+      methodID: 'claude-max',
+      access: account.access,
+      refresh: 'refresh',
+      expires: Date.now() + 3_600_000,
+    }))
+    await plugin.setup(result.ctx as any)
+    const scope = {
+      sessionID: 'session',
+      agent: 'build',
+      model: { providerID: 'anthropic', id: modelID },
+    }
+    const request = async () => {
+      const input = {
+        ...scope,
+        request: new Request('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          body: JSON.stringify({ model: modelID, messages: [] }),
+          headers: { [RETRY_HEADER]: 'must-not-be-sent' },
+        }),
+      }
+      await result.sessionHooks.get('http.request')!(input)
+      expect(input.request.headers.has(RETRY_HEADER)).toBeFalse()
+      return input.request
+    }
+    const respond = async (
+      request: Request,
+      seconds = 18_000,
+      status = 429,
+    ) => {
+      const input = {
+        ...scope,
+        request,
+        response: new Response('{"error":{"message":"rate limit"}}', {
+          status,
+          headers: {
+            'retry-after': String(seconds),
+            'content-type': 'application/json',
+          },
+        }),
+      }
+      await result.sessionHooks.get('http.response')!(input)
+      return input.response
+    }
+    const retry = async (
+      request: Request,
+      response: Response,
+      delay = 900_000,
+    ) => {
+      // The native Effect HttpContext stores query parameters separately.
+      const url = new URL(request.url)
+      url.search = ''
+      const input: RetryEvent = {
+        ...scope,
+        error: { type: 'provider.rate-limit', status: response.status },
+        http: {
+          url: url.toString(),
+          status: response.status,
+          headers: Object.fromEntries(response.headers),
+        },
+        decision: { retry: true, delay },
+      }
+      await result.sessionHooks.get('retry')!(input)
+      return input.decision
+    }
+    return { ...result, account, scope, request, respond, retry }
+  }
+
+  test('uses the exact OAuth response reset through all three hooks', async () => {
+    const f = await fixture()
+    const request = await f.request()
+    const response = await f.respond(request)
+    expect(response.headers.has(RETRY_HEADER)).toBeTrue()
+    expect(await response.text()).toBe('{"error":{"message":"rate limit"}}')
+    const decision = await f.retry(request, response)
+    expect(decision.retry && decision.delay).toBeGreaterThan(18_000_000)
+  })
+
+  test.each([
+    'claude-sonnet-4-6',
+    'claude-opus-4-6',
+    'team-opus-router',
+  ])('does not apply family snapshots to %s through the HTTP/retry hooks', async (modelID) => {
+    const f = await fixture(modelID)
+    const request = await f.request()
+    for (const status of [
+      undefined,
+      'rejected',
+      'allowed',
+      'allowed_warning',
+    ]) {
+      const headers = new Headers({
+        'retry-after': '10',
+        'anthropic-ratelimit-unified-7d_opus-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_opus-reset': String(
+          Math.floor(Date.now() / 1000) + 604_800,
+        ),
+        'anthropic-ratelimit-unified-7d_sonnet-status': 'rejected',
+        'anthropic-ratelimit-unified-7d_sonnet-reset': String(
+          Math.floor(Date.now() / 1000) + 604_800,
+        ),
+      })
+      if (status) headers.set('anthropic-ratelimit-unified-status', status)
+      const input = {
+        ...f.scope,
+        request,
+        response: new Response(
+          '{"error":{"type":"rate_limit_error","message":"Too many requests"}}',
+          { status: 429, headers },
+        ),
+      }
+      await f.sessionHooks.get('http.response')!(input)
+      const decision = await f.retry(request, input.response, 2000)
+      expect(decision.retry && decision.delay).toBeGreaterThan(10_000)
+      expect(decision.retry && decision.delay).toBeLessThanOrEqual(11_000)
+    }
+  })
+
+  test.each([
+    'claude-sonnet-4-6',
+    'custom-alias',
+  ])('uses aggregate plan quota without Retry-After for %s through all three hooks', async (modelID) => {
+    const f = await fixture(modelID)
+    const request = await f.request()
+    const now = Math.floor(Date.now() / 1000)
+    const body = JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: 'You have reached your usage limit.',
+      },
+      request_id: 'req_test',
+    })
+    const input = {
+      ...f.scope,
+      request,
+      response: new Response(body, {
+        status: 429,
+        headers: {
+          'content-type': 'application/json',
+          date: new Date(now * 1000).toUTCString(),
+          'x-should-retry': 'true',
+          'anthropic-ratelimit-unified-status': 'rejected',
+          'anthropic-ratelimit-unified-reset': String(now + 18_000),
+          'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+          'anthropic-ratelimit-unified-5h-status': 'rejected',
+          'anthropic-ratelimit-unified-5h-reset': String(now + 18_000),
+          'anthropic-ratelimit-unified-5h-utilization': '1.0',
+          'anthropic-ratelimit-unified-7d-status': 'allowed',
+          'anthropic-ratelimit-unified-7d-reset': String(now + 604_800),
+          'anthropic-ratelimit-unified-7d_opus-status': 'rejected',
+          'anthropic-ratelimit-unified-7d_opus-reset': String(now + 604_800),
+        },
+      }),
+    }
+    await f.sessionHooks.get('http.response')!(input)
+    expect(input.response.headers.has('retry-after')).toBeFalse()
+    expect(await input.response.text()).toBe(body)
+    const decision = await f.retry(request, input.response)
+    expect(decision.retry && decision.delay).toBeGreaterThan(18_000_000)
+    expect(decision.retry && decision.delay).toBeLessThanOrEqual(18_001_000)
+  })
+
+  test('isolates concurrent failures on the same session and account', async () => {
+    const f = await fixture()
+    const [a, b] = await Promise.all([f.request(), f.request()])
+    const [long, short] = await Promise.all([
+      f.respond(b, 36_000),
+      f.respond(a, 18_000),
+    ])
+    const [first, second] = await Promise.all([
+      f.retry(a, short),
+      f.retry(b, long),
+    ])
+    expect(first.retry && first.delay).toBeGreaterThan(18_000_000)
+    expect(first.retry && first.delay).toBeLessThan(18_002_000)
+    expect(second.retry && second.delay).toBeGreaterThan(36_000_000)
+  })
+
+  test('ignores a previous account at response time and retry time', async () => {
+    const f = await fixture()
+    const request = await f.request()
+    const response = await f.respond(request)
+    f.account.id = 'account-b'
+    f.account.access = 'access-b'
+    expect(await f.retry(request, response)).toEqual({
+      retry: true,
+      delay: 900_000,
+    })
+    expect((await f.respond(request)).headers.has(RETRY_HEADER)).toBeFalse()
+  })
+
+  test('supports token refresh within the same connection', async () => {
+    const f = await fixture()
+    const request = await f.request()
+    const response = await f.respond(request)
+    f.account.access = 'rotated-access'
+    const decision = await f.retry(request, response)
+    expect(decision.retry && decision.delay).toBeGreaterThan(18_000_000)
+  })
+
+  test('retains the provider failure and native decision when credential lookup fails', async () => {
+    const f = await fixture()
+    const request = await f.request()
+    const marked = await f.respond(request)
+    f.ctx.integration.connection.resolve.mockImplementation(async () => {
+      throw new Error('connection removed')
+    })
+    expect(await f.retry(request, marked)).toEqual({
+      retry: true,
+      delay: 900_000,
+    })
+    const unmarked = await f.respond(request)
+    expect(unmarked.status).toBe(429)
+    expect(unmarked.headers.has(RETRY_HEADER)).toBeFalse()
+    expect(await unmarked.text()).toBe('{"error":{"message":"rate limit"}}')
+  })
+
+  test('does not resolve credentials or override old-host retry without HTTP metadata', async () => {
+    const f = await fixture()
+    const before = f.ctx.integration.connection.resolve.mock.calls.length
+    const input = {
+      ...f.scope,
+      error: { type: 'provider.rate-limit', status: 429 },
+      decision: { retry: true, delay: 2000 },
+    }
+    await f.sessionHooks.get('retry')!(input)
+    expect(input.decision).toEqual({ retry: true, delay: 2000 })
+    expect(f.ctx.integration.connection.resolve.mock.calls.length).toBe(before)
+  })
+
+  test('still loads OAuth when an older host rejects retry hook registration', async () => {
+    const f = createMockContext()
+    f.ctx.session.hook.mockImplementation(async (name, cb) => {
+      if (name === 'retry') throw new Error('Unknown hook')
+      f.sessionHooks.set(name, cb)
+      return { dispose: mock(async () => {}) }
+    })
+    const warning = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await plugin.setup(f.ctx as any)
+      expect(f.sessionHooks.has('http.request')).toBeTrue()
+      expect(f.sessionHooks.has('http.response')).toBeTrue()
+      expect(warning).toHaveBeenCalledTimes(1)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  test('does not mark API-key, cancelled or non-429 responses', async () => {
+    const f = await fixture()
+    const apiKeyRequest = new Request('https://api.anthropic.com/v1/messages', {
+      headers: { 'x-api-key': 'key' },
+    })
+    expect(
+      (await f.respond(apiKeyRequest)).headers.has(RETRY_HEADER),
+    ).toBeFalse()
+    const request = await f.request()
+    expect(
+      (await f.respond(request, 18_000, 529)).headers.has(RETRY_HEADER),
+    ).toBeFalse()
+    const controller = new AbortController()
+    const aborted = new Request(request, { signal: controller.signal })
+    controller.abort()
+    expect((await f.respond(aborted)).headers.has(RETRY_HEADER)).toBeFalse()
   })
 })
 

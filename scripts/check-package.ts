@@ -121,6 +121,7 @@ try {
 
   const integrationMethods: unknown[] = []
   await plugin.setup({
+    options: {},
     integration: {
       transform: async (
         transform: (editor: {
